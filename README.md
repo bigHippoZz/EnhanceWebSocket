@@ -1,4 +1,4 @@
-### WebSocket 添加断线重连机制
+## 基于 WebSocket 封装，添加断线重连功能
 
 ## Examples
 
