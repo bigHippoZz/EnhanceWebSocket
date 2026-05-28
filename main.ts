@@ -15,6 +15,7 @@ export class Dispatcher<T> {
   }
 }
 
+
 export class EnhanceWebSocket {
   path: string;
   private queue: Array<string> = [];
