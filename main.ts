@@ -1,42 +1,50 @@
+type Listener<T> = (val: T) => void;
+
 export class Dispatcher<T> {
-  private listeners: Array<(val: T) => void> = [];
-  public subscribe(func: (val: T) => void) {
+  private listeners: Array<Listener<T>> = [];
+
+  public subscribe(func: Listener<T>) {
     this.listeners.push(func);
     return () => {
       const index = this.listeners.indexOf(func);
-      this.listeners.splice(index, 1);
+      // 重复取消订阅时 indexOf 返回 -1，splice(-1, 1) 会误删最后一个监听器
+      if (index !== -1) this.listeners.splice(index, 1);
     };
   }
+
   public dispatch(event: T) {
-    for (let i = 0; i < this.listeners.length; i++) {
-      const listener = this.listeners[i];
+    // 遍历副本，避免监听器在回调中取消订阅导致跳过后续监听器
+    for (const listener of [...this.listeners]) {
       listener(event);
     }
   }
 }
 
+const MAX_BACKOFF_EXPONENT = 5; // 最大重连间隔 (2^5 - 1) 秒 ≈ 31 秒
 
 export class EnhanceWebSocket {
   path: string;
-  private queue: Array<string> = [];
+  private queue: Array<string> = []; // 连接未就绪时待发送的消息
   private connection: WebSocket | null = null; // 当前ws的引用
-  private connectionAttempts: number; // 当前重连次数
-  private reconnectionDelay: boolean; // 是否开启重连机制
-  private setTimeoutId!: ReturnType<typeof setTimeout> | null; // 当前重连定时器id
+  private connectionAttempts = 0; // 当前重连次数
+  private reconnect: boolean; // 是否开启重连机制
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null; // 当前重连定时器
 
-  private onopenDispatcher: Dispatcher<Event>;
-  private onerrorDispatcher: Dispatcher<Event>;
-  private oncloseDispatcher: Dispatcher<CloseEvent>;
-  private onmessageDispatcher: Dispatcher<MessageEvent>;
+  private readonly dispatchers = {
+    open: new Dispatcher<Event>(),
+    error: new Dispatcher<Event>(),
+    close: new Dispatcher<CloseEvent>(),
+    message: new Dispatcher<MessageEvent>(),
+  };
+
   constructor(path: string, reconnectionDelay = true) {
     this.path = path;
-    this.reconnectionDelay = reconnectionDelay; // 是否开启重连机制
-    this.connectionAttempts = 0;
-    this.onopenDispatcher = new Dispatcher();
-    this.oncloseDispatcher = new Dispatcher();
-    this.onmessageDispatcher = new Dispatcher();
-    this.onerrorDispatcher = new Dispatcher();
-    this.initialization();
+    this.reconnect = reconnectionDelay;
+    this.dispatchers.open.subscribe(() => {
+      this.connectionAttempts = 0; // 连接成功后重置退避时间
+      this.flushQueue();
+    });
+    this.dispatchers.close.subscribe(() => this.scheduleReconnection());
   }
 
   public openConnection() {
@@ -46,87 +54,108 @@ export class EnhanceWebSocket {
     ) {
       return;
     }
+    this.clearReconnectTimer();
+    this.connectionAttempts++;
 
+    let socket: WebSocket;
     try {
-      this.connection = new WebSocket(this.path);
-      this.connection.onopen = (value) => this.onopenDispatcher.dispatch(value);
-      this.connection.onmessage = (value) =>
-        this.onmessageDispatcher.dispatch(value);
-      this.connection.onerror = (value) =>
-        this.onerrorDispatcher.dispatch(value);
-      this.connection.onclose = (value) =>
-        this.oncloseDispatcher.dispatch(value);
+      socket = new WebSocket(this.path);
     } catch (error) {
       this.connection = null;
-      console.warn("openConnection is error");
-    } finally {
-      this.connectionAttempts++;
+      console.warn("openConnection is error", error);
+      this.scheduleReconnection();
+      return;
     }
+
+    this.connection = socket;
+    // 只转发当前连接的事件，忽略已被替换的旧连接
+    const forward =
+      <T>(dispatcher: Dispatcher<T>) =>
+      (event: T) => {
+        if (this.connection === socket) dispatcher.dispatch(event);
+      };
+    socket.onopen = forward(this.dispatchers.open);
+    socket.onmessage = forward(this.dispatchers.message);
+    socket.onerror = forward(this.dispatchers.error);
+    socket.onclose = forward(this.dispatchers.close);
   }
 
   public closeConnection() {
-    if (
-      this.connection instanceof WebSocket &&
-      this.readyState !== WebSocket.CLOSING &&
-      this.readyState !== WebSocket.CLOSED
-    ) {
-      this.connection.onclose = null;
-      this.connection.onerror = null;
-      this.connection.close();
-    }
+    const socket = this.connection;
     this.connection = null;
-    if (this.setTimeoutId) {
-      clearTimeout(this.setTimeoutId);
-      this.setTimeoutId = null;
+    if (
+      socket &&
+      socket.readyState !== WebSocket.CLOSING &&
+      socket.readyState !== WebSocket.CLOSED
+    ) {
+      socket.onclose = null;
+      socket.onerror = null;
+      socket.close();
     }
+    this.clearReconnectTimer();
     this.connectionAttempts = 0;
   }
 
-  public onmessage(func: (event: MessageEvent) => void) {
-    return this.onmessageDispatcher.subscribe(func);
-  }
-  public onopen(func: (event: Event) => void) {
-    return this.onopenDispatcher.subscribe(func);
+  public onmessage(func: Listener<MessageEvent>) {
+    return this.dispatchers.message.subscribe(func);
   }
 
-  public onerror(func: (event: Event) => void) {
-    return this.onerrorDispatcher.subscribe(func);
+  public onopen(func: Listener<Event>) {
+    return this.dispatchers.open.subscribe(func);
   }
 
-  public onclose(func: (event: CloseEvent) => void) {
-    return this.oncloseDispatcher.subscribe(func);
+  public onerror(func: Listener<Event>) {
+    return this.dispatchers.error.subscribe(func);
+  }
+
+  public onclose(func: Listener<CloseEvent>) {
+    return this.dispatchers.close.subscribe(func);
   }
 
   public send(msg: string) {
-    if (this.readyState === WebSocket.OPEN)
-      return (this.connection as WebSocket).send(msg);
-    this.queue.push(msg);
+    if (this.connection && this.readyState === WebSocket.OPEN) {
+      this.connection.send(msg);
+    } else {
+      this.queue.push(msg);
+    }
   }
 
   // websocket状态码
   public get readyState(): number {
-    if (this.connection === null) return WebSocket.CLOSED;
-    return this.connection.readyState;
+    return this.connection ? this.connection.readyState : WebSocket.CLOSED;
   }
 
-  // 重连时间
+  // 重连时间：随重连次数指数增长
   private get timeout(): number {
-    // 依次增加重连时间 最大值为16秒
-    return (Math.pow(2, Math.min(this.connectionAttempts, 5)) - 1) * 1000;
+    return (
+      (Math.pow(2, Math.min(this.connectionAttempts, MAX_BACKOFF_EXPONENT)) -
+        1) *
+      1000
+    );
   }
-  private initialization() {
-    const processWaitingMessage = () => {
-      this.queue.forEach((msg) => this.send(msg));
-      this.queue.length = 0;
-    };
-    const processReconnection = () => {
-      if (!this.reconnectionDelay) return;
-      this.setTimeoutId = setTimeout(() => this.openConnection(), this.timeout);
-    };
-    this.onopenDispatcher.subscribe(processWaitingMessage);
-    this.oncloseDispatcher.subscribe(processReconnection);
+
+  private flushQueue() {
+    const pending = this.queue.splice(0);
+    pending.forEach((msg) => this.send(msg));
   }
-  static stringify(target: any): string {
+
+  private scheduleReconnection() {
+    if (!this.reconnect) return;
+    this.clearReconnectTimer();
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.openConnection();
+    }, this.timeout);
+  }
+
+  private clearReconnectTimer() {
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+  }
+
+  static stringify(target: unknown): string {
     return JSON.stringify(target);
   }
 
